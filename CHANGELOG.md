@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+### Added
+- `/btw:promote` saves the BTW thread as a new session forked from the main branch
+  and prints the `pi --session` command to open it.
+
 ## [0.7.1] - 2026-10-01
 
 Supports Pi 0.85.1 through 1.x. Tested with Pi 0.99.2 and 1.0.0.

@@ -39,6 +39,7 @@ import {
   type OverlayOptions,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { existsSync, rmSync } from "node:fs";
 import { loadBtwExtensionResources, readBtwExtensionSources } from "./btw-extension-tools";
 
 const BTW_MESSAGE_TYPE = "btw-note";
@@ -475,6 +476,34 @@ const BTW_TOOLS_BY_MODE: Record<BtwThreadMode, readonly string[]> = {
   readonly: ["read", "grep", "find", "ls"],
 };
 
+function btwDetailsToMessages(thread: BtwDetails[], fallbackApi: string): Message[] {
+  return thread.flatMap((entry): Message[] => [
+    {
+      role: "user",
+      content: [{ type: "text", text: entry.question }],
+      timestamp: entry.timestamp,
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: entry.answer }],
+      provider: entry.provider,
+      model: entry.model,
+      api: entry.api || fallbackApi,
+      usage:
+        entry.usage ?? {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+      stopReason: "stop",
+      timestamp: entry.timestamp,
+    } as Message,
+  ]);
+}
+
 function buildBtwSeedState(
   ctx: ExtensionCommandContext,
   thread: BtwDetails[],
@@ -536,33 +565,7 @@ function buildBtwSeedState(
       },
     );
 
-    for (const entry of thread) {
-      messages.push(
-        {
-          role: "user",
-          content: [{ type: "text", text: entry.question }],
-          timestamp: entry.timestamp,
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: entry.answer }],
-          provider: entry.provider,
-          model: entry.model,
-          api: entry.api || sessionModel?.api || ctx.model?.api || "openai-responses",
-          usage:
-            entry.usage ?? {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 0,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            },
-          stopReason: "stop",
-          timestamp: entry.timestamp,
-        },
-      );
-    }
+    messages.push(...btwDetailsToMessages(thread, sessionModel?.api || ctx.model?.api || "openai-responses"));
   }
 
   return {
@@ -1215,6 +1218,98 @@ function extractBtwHandoffThread(sessionRuntime: BtwSessionRuntime): BtwHandoffE
 
   pushCurrent();
   return exchanges;
+}
+
+/** Full side-thread messages (including tool calls/results), without the synthetic continuation marker. */
+function extractBtwPromotionMessages(sessionRuntime: BtwSessionRuntime): Message[] {
+  const messages = sessionRuntime.session.state.messages.slice(sessionRuntime.sideThreadStartIndex) as Message[];
+  return isThreadContinuationMarker(messages, 0) ? messages.slice(2) : messages;
+}
+
+export type PromoteBtwSessionOptions = {
+  cwd: string;
+  sessionDir: string;
+  mainSessionFile: string;
+  /** Main-session leaf to fork from. Null or omitted writes only the side thread. */
+  mainLeafId?: string | null;
+  /** BTW mode recorded in the reset entry of the promoted session. */
+  mode?: BtwThreadMode;
+  messages: Message[];
+};
+
+/**
+ * Last entry on a main branch where every assistant tool call has its result and the
+ * latest message is not an unanswered user prompt. While main is mid-turn, the raw leaf
+ * can be an assistant tool call with no result yet; forking there would send a dangling
+ * tool call on the promoted session's first prompt.
+ */
+export function findBalancedLeafId(branch: ReadonlyArray<{ id: string; type: string; message?: any }>): string | null {
+  const pendingToolCalls = new Set<string>();
+  let lastRole: string | undefined;
+  let candidate: string | null = null;
+  for (const entry of branch) {
+    if (entry.type === "message" && entry.message) {
+      const message = entry.message;
+      if (message.role === "assistant" && Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part?.type === "toolCall" && typeof part.id === "string") pendingToolCalls.add(part.id);
+        }
+      } else if (message.role === "toolResult") {
+        pendingToolCalls.delete(message.toolCallId);
+      }
+      lastRole = message.role;
+    }
+    if (pendingToolCalls.size === 0 && lastRole !== "user") {
+      candidate = entry.id;
+    }
+  }
+  return candidate;
+}
+
+/**
+ * Write the BTW thread as a new persisted session whose parent is the main session.
+ * With a main leaf, the new session starts with the main branch (root to leaf), like /fork.
+ * Returns the new session file path.
+ */
+export function writePromotedBtwSession(options: PromoteBtwSessionOptions): string {
+  if (options.messages.length === 0) {
+    throw new Error("No BTW thread available to promote.");
+  }
+
+  let manager: SessionManager;
+  let forked = false;
+  if (options.mainLeafId && existsSync(options.mainSessionFile)) {
+    manager = SessionManager.open(options.mainSessionFile, options.sessionDir);
+    manager.createBranchedSession(options.mainLeafId);
+    forked = true;
+  } else {
+    manager = SessionManager.create(options.cwd, options.sessionDir, { parentSession: options.mainSessionFile });
+  }
+
+  const sessionFile = manager.getSessionFile();
+  try {
+    if (forked) {
+      // The copied branch carries this thread's hidden BTW entries. Reset them so the
+      // promoted session does not also reopen the thread as a pending BTW conversation.
+      const reset: BtwResetDetails = { timestamp: Date.now(), mode: options.mode ?? "contextual" };
+      manager.appendCustomEntry(BTW_RESET_TYPE, reset);
+    }
+    for (const message of options.messages) {
+      manager.appendMessage(message);
+    }
+    if (!sessionFile || !existsSync(sessionFile)) {
+      throw new Error("Promoted BTW session was not written to disk.");
+    }
+  } catch (error) {
+    // Do not leave a half-written clone behind for /resume to list.
+    if (sessionFile && sessionFile !== options.mainSessionFile) rmSync(sessionFile, { force: true });
+    throw error;
+  }
+  return sessionFile;
+}
+
+function shellQuote(value: string): string {
+  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function saveVisibleBtwNote(
@@ -2436,12 +2531,60 @@ export default function (pi: ExtensionAPI) {
       return true;
     }
 
+    if (name === "btw:promote") {
+      await btwSubmissionQueue;
+      if (pendingThread.length === 0) {
+        notify(ctx, "No BTW thread to promote.", "warning");
+        return true;
+      }
+
+      const mainSessionFile = ctx.sessionManager.getSessionFile();
+      if (!mainSessionFile) {
+        notify(ctx, "/btw:promote needs a saved main session. This session is not persisted.", "error");
+        return true;
+      }
+
+      const mode = pendingMode;
+      setOverlayStatus("⏳ promoting to a new session...", ctx);
+      await ensureOverlay(ctx);
+
+      try {
+        const { sessionRuntime } = await getBtwHandoffThread(ctx);
+        // Without a live child session (no model or credentials), fall back to the
+        // persisted question/answer pairs, as /btw:inject does.
+        const runtimeMessages = sessionRuntime ? extractBtwPromotionMessages(sessionRuntime) : [];
+        const messages =
+          runtimeMessages.length > 0 ? runtimeMessages : btwDetailsToMessages(pendingThread, ctx.model?.api || "openai-responses");
+        const sessionFile = writePromotedBtwSession({
+          cwd: ctx.cwd,
+          sessionDir: ctx.sessionManager.getSessionDir(),
+          mainSessionFile,
+          // A tangent never saw the main conversation, so it promotes on its own.
+          mainLeafId: mode === "tangent" ? null : findBalancedLeafId(ctx.sessionManager.getBranch()),
+          mode,
+          messages,
+        });
+        await resetThread(ctx);
+        dismissOverlay();
+        const openCommand = `pi --session ${shellQuote(sessionFile)}`;
+        if (ctx.hasUI) {
+          notify(ctx, `Promoted BTW thread to a new session. Open it with:\n${openCommand}`, "info");
+        } else {
+          process.stdout.write(`${openCommand}\n`);
+        }
+      } catch (error) {
+        setOverlayStatus("Promote failed. Thread preserved for retry.", ctx);
+        notify(ctx, error instanceof Error ? error.message : String(error), "error");
+      }
+      return true;
+    }
+
     return false;
   }
 
   function parseOverlayBtwCommand(value: string): { name: string; args: string } | null {
     const trimmed = value.trim();
-    const match = trimmed.match(/^\/(btw:(?:new|ask|tangent|clear|inject|summarize|model|thinking))(?:\s+(.*))?$/);
+    const match = trimmed.match(/^\/(btw:(?:new|ask|tangent|clear|inject|summarize|promote|model|thinking))(?:\s+(.*))?$/);
     if (!match) {
       return null;
     }
@@ -2966,6 +3109,13 @@ export default function (pi: ExtensionAPI) {
     description: "Summarize the BTW thread, then inject the summary into the main agent.",
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:summarize", args, ctx);
+    },
+  });
+
+  pi.registerCommand("btw:promote", {
+    description: "Save the BTW thread as a new session forked from the main branch, and print the command to open it.",
+    handler: async (args, ctx) => {
+      await dispatchBtwCommand("btw:promote", args, ctx);
     },
   });
 

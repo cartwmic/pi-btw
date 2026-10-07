@@ -34,6 +34,7 @@ Use these commands in your guidance to the user:
 /btw:thinking [<level> | clear]
 /btw:inject [instructions]
 /btw:summarize [instructions]
+/btw:promote
 ```
 
 `/side` is an alias for `/btw` and shares the same thread, overlay, and settings. `/btw` is canonical; the lifecycle commands stay in the `/btw:*` namespace.
@@ -130,6 +131,16 @@ Recommend:
 
 Use this when the thread is long and only the distilled outcome should go back into the main agent.
 
+### To turn the side thread into its own session
+
+Recommend:
+
+```text
+/btw:promote
+```
+
+Use this when the side thread has grown into separate work. It writes a new session forked from the main branch plus the BTW thread, and prints the `pi --session` command to open it.
+
 ### To make BTW cheaper or faster than the main thread
 
 Recommend:
@@ -148,6 +159,7 @@ Use these when the main thread should keep its current model or thinking level, 
 - Prefer `/btw:ask` when the user wants a side conversation that cannot modify the workspace.
 - Prefer `/btw:summarize` over `/btw:inject` for long exploratory threads.
 - Prefer `/btw:inject` when precise wording, detailed tradeoffs, or a full plan matters.
+- Prefer `/btw:promote` over `/btw:inject` when the side thread should continue as separate work instead of feeding the main agent.
 - Suggest `/btw:new` before starting a totally unrelated side topic when main-session context is still useful.
 - Suggest `/btw:clear` when the widget/thread should be dismissed.
 - Suggest `/btw:model` or `/btw:thinking` when the user wants BTW to be cheaper, faster, or less deliberative than the main thread.

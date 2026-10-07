@@ -68,6 +68,7 @@ pi install /absolute/path/to/pi-btw
 /btw:thinking low
 /btw:inject implement the plan we just discussed
 /btw:summarize turn that side thread into a short handoff
+/btw:promote
 /btw:clear
 ```
 
@@ -152,6 +153,16 @@ pi install /absolute/path/to/pi-btw
 - if pi is busy, queues it as a follow-up
 - clears the BTW thread after sending
 
+### `/btw:promote`
+
+- saves the BTW thread as a new session instead of sending it back to main
+- the new session starts with the main branch (root to the current leaf, like `/fork`), then the full BTW exchanges, including tool calls
+- works while main is busy: if main is mid-turn, the fork stops at the last point where every tool call has its result
+- a `/btw:tangent` thread never saw main, so it promotes on its own
+- the new session's parent is the main session; the main session keeps running
+- prints `pi --session <file>` so you can open it in another pane or tab
+- clears the BTW thread after writing; needs a saved main session (not `--no-session`)
+
 ### `/btw:model [<provider> <model> <api> | clear]`
 
 - with no args, shows the current effective BTW model and whether it is inherited or overridden
@@ -179,7 +190,7 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 - `/btw:summarize` uses the current effective BTW model but keeps thinking off
 - the overlay transcript/status line is driven from sub-session events, so tool activity, streaming deltas, failures, and recovery are all visible without scraping rendered output
 - child prompts preserve the main session's instructions and append an authoritative list of their own tools; inherited tool/skill instructions and historical tool calls do not grant additional capabilities
-- handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
+- handoff commands (`/btw:inject`, `/btw:summarize`, and `/btw:promote`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
 
 ### Opt-in extension tools
 
@@ -229,7 +240,7 @@ conversation-history entries.
 
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
-- `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
+- `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:model`, `/btw:thinking`, `/btw:inject`, `/btw:summarize`, and `/btw:promote` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
 - any other slash-prefixed input is routed through the BTW sub-session's normal `prompt()` path
 - this means ordinary pi slash commands like `/help` are handled by the sub-session instead of being rejected by a modal-only fallback
 - if the sub-session cannot handle a slash command, BTW surfaces the real sub-session failure through the transcript/status state instead of inventing an "unsupported slash input" warning

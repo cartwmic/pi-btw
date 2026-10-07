@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,6 +87,9 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
     ModelRuntime: modelRuntimeExport,
     SessionManager: {
       ...actual.SessionManager,
+      // Static class methods are not enumerable, so spread does not copy them.
+      create: actual.SessionManager.create.bind(actual.SessionManager),
+      open: actual.SessionManager.open.bind(actual.SessionManager),
       inMemory: sessionManagerInMemoryMock,
     },
   };
@@ -577,6 +581,14 @@ function createHarness(
     getEntries: () => entries,
     getLeafId: () => "leaf",
     getBranch: () => entries,
+    sessionFile: undefined as string | undefined,
+    sessionDir: undefined as string | undefined,
+    getSessionFile() {
+      return this.sessionFile;
+    },
+    getSessionDir() {
+      return this.sessionDir;
+    },
   };
 
   const model = { provider: "test-provider", id: "test-model", api: "openai-responses" };
@@ -805,6 +817,7 @@ function createHarness(
   return {
     api,
     entries,
+    sessionManager,
     messageRenderers,
     notifications,
     widgets,
@@ -3122,6 +3135,95 @@ describe("btw runtime behavior", () => {
     expect(harness.sentUserMessages[0]).toEqual({
       content: "Here is a side conversation I had. Queue this behind the active turn.\n\nUser: busy question\nAssistant: Busy answer",
       options: { deliverAs: "followUp" },
+    });
+  });
+
+  describe("/btw:promote", () => {
+    let dir: string;
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), "btw-promote-cmd-"));
+    });
+    afterEach(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    function promotedFiles() {
+      return readdirSync(dir).filter((name) => name.endsWith(".jsonl")).map((name) => join(dir, name));
+    }
+
+    it("writes the side thread to a new session, prints the open command, and clears the thread", async () => {
+      const harness = createHarness();
+      harness.sessionManager.sessionFile = join(dir, "main.jsonl");
+      harness.sessionManager.sessionDir = dir;
+      promptStreamMock.mockImplementation(() => streamAnswer("Side answer"));
+
+      await harness.runSessionStart();
+      await harness.command("btw", "side question");
+      const overlayHandle = harness.overlayHandles.at(-1);
+      await harness.command("btw:promote", "");
+
+      const files = promotedFiles();
+      expect(files).toHaveLength(1);
+      const lines = readFileSync(files[0], "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(lines[0]).toMatchObject({ type: "session", parentSession: join(dir, "main.jsonl") });
+      expect(lines.filter((e) => e.type === "message").map((e) => e.message.content[0].text)).toEqual([
+        "side question",
+        "Side answer",
+      ]);
+      expect(harness.notifications.at(-1)?.message).toContain(`pi --session ${files[0]}`);
+      expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
+      expect(overlayHandle?.hideCalls).toBe(1);
+      expect(harness.sentUserMessages).toHaveLength(0);
+    });
+
+    it("works while the main session is busy", async () => {
+      const harness = createHarness();
+      harness.sessionManager.sessionFile = join(dir, "main.jsonl");
+      harness.sessionManager.sessionDir = dir;
+      promptStreamMock.mockImplementation(() => streamAnswer("Busy side answer"));
+
+      await harness.runSessionStart();
+      await harness.command("btw", "busy side question");
+      harness.setIdle(false);
+      await harness.command("btw:promote", "");
+
+      expect(promotedFiles()).toHaveLength(1);
+      expect(harness.notifications.at(-1)?.message).toContain("pi --session");
+    });
+
+    it("is accepted from inside the BTW overlay composer", async () => {
+      const harness = createHarness();
+      harness.sessionManager.sessionFile = join(dir, "main.jsonl");
+      harness.sessionManager.sessionDir = dir;
+      promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
+
+      await harness.runSessionStart();
+      await harness.command("btw", "overlay question");
+      const overlay = harness.latestOverlayComponent();
+      overlay.input.onSubmit?.("/btw:promote");
+      await vi.waitFor(() => expect(promotedFiles()).toHaveLength(1));
+      expect(promptStreamMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("warns when there is no thread", async () => {
+      const harness = createHarness();
+      harness.sessionManager.sessionFile = join(dir, "main.jsonl");
+      harness.sessionManager.sessionDir = dir;
+      await harness.runSessionStart();
+      await harness.command("btw:promote", "");
+      expect(harness.notifications.at(-1)).toEqual({ message: "No BTW thread to promote.", type: "warning" });
+      expect(promotedFiles()).toHaveLength(0);
+    });
+
+    it("refuses an unsaved main session and keeps the thread", async () => {
+      const harness = createHarness();
+      promptStreamMock.mockImplementation(() => streamAnswer("Kept answer"));
+      await harness.runSessionStart();
+      await harness.command("btw", "kept question");
+      await harness.command("btw:promote", "");
+      expect(harness.notifications.at(-1)?.type).toBe("error");
+      expect(harness.notifications.at(-1)?.message).toContain("needs a saved main session");
+      expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(0);
     });
   });
 
