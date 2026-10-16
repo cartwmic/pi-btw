@@ -16,21 +16,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi: [locked, minimum, latest]
+        pi: [locked]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
-      - name: Resolve compatibility version
-        if: matrix.pi != 'locked'
-        env:
-          PI_VERSION: ${{ matrix.pi == 'minimum' && '0.85.1' || 'latest' }}
-        run: >-
-          npm install --package-lock-only --ignore-scripts --save-dev --save-exact
-          "@earendil-works/pi-ai@$PI_VERSION"
-          "@earendil-works/pi-coding-agent@$PI_VERSION"
-          "@earendil-works/pi-tui@$PI_VERSION"
-      - run: npm ci
+          node-version: 24.18.1
+      - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run typecheck

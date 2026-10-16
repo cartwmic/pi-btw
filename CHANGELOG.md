@@ -5,8 +5,25 @@ All notable changes to this project are documented here.
 ## Unreleased
 
 ### Added
+- Desktop TUI `/btw`, `/side`, `/btw:tangent` and `/btw:ask` now open a normal Pi 1.1.0
+  CLI child session in an inset popup (own model, editor, tools, dialogs, saved
+  session) instead of the SDK mini-chat. Requires the managed `btw-native-session`
+  Pi patch and macOS arm64 with the package-local node-pty prebuilt; there is no
+  fallback to the old chat on the desktop TUI. Headless/RPC/SDK hosts keep the SDK route.
+- `/btw menu` (start contextual, blank or read-only; reopen; hand off; open separately),
+  hidden-attention status (`BTW: finished` / `failed` / `needs your input`),
+  `/btw:inject` and `/btw:summarize` on the native session (active branch only;
+  summary bounded: 24000 characters in, 2048 tokens out, 60 s, thinking off, no tools),
+  `/btw:promote` and `/btw:clear` hints. Open separately and promote ask you to quit
+  a live popup child first (advice only; a session file has no lock).
+- `/btw:new`, `/btw:model` and `/btw:thinking` are unavailable while a native session exists.
 - `/btw:promote` saves the BTW thread as a new session forked from the main branch
   and prints the `pi --session` command to open it.
+
+### Changed
+- Pi peer/dev dependencies are pinned to 1.1.0; node-pty 1.1.0, @xterm/headless 5.5.0 and
+  node-addon-api 7.1.0 are runtime dependencies. CI tests the locked Pi 1.1.0 cohort only
+  (Node 24.18.1, `npm ci --ignore-scripts`); the old minimum/latest matrix is removed.
 
 ## [0.7.1] - 2026-10-01
 

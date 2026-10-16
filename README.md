@@ -1,33 +1,72 @@
 # pi-btw
 
-A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/btw` side conversation channel.
+A [pi](https://github.com/earendil-works/pi-mono) extension that adds a side conversation, `/btw` / `/side`, next to your main session.
 
-`/btw` opens a real pi sub-session with coding-tool access, and it runs immediately even while the main agent is still busy.
+**On the desktop TUI the side conversation is a normal Pi CLI session** (a child process on a pseudo-terminal) shown in an inset popup over your main session. It has its own model, thinking level, editor, tools, dialogs, transcript, links and a normal saved session file. There is no reduced chat and no silent fallback to one: if the native hooks are missing, the command fails with a clear message.
 
-![BTW overlay example](docs/btw-overlay.png)
+Headless, RPC and SDK hosts keep the older SDK side-chat route, described under [Legacy SDK/headless route](#legacy-sdkheadless-route).
 
-## What it does
+Status of this text: written against candidate-r12g, which has not been copied into the maintained tree. Items marked *scripted* were observed with a scripted provider (no real model). See [What has and has not been verified](#what-has-and-has-not-been-verified).
 
-- opens a parallel side conversation without interrupting the main run
-- runs that side conversation as a real pi sub-session with `read` / `bash` / `edit` / `write` tool access
-- keeps a continuous BTW thread by default
-- accepts `/side` as an alias for the `/btw` entry command
-- supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
-- supports `/btw:ask` for a read-only side thread that inherits main-session context but exposes only `read` / `grep` / `find` / `ls`
-- opens a focused BTW modal shell with its own composer and transcript
-- keeps the BTW overlay open while you switch focus back to the main editor with `Alt+/`, `Super+/`, or `Ctrl+Alt+W` (all remappable)
-- keeps BTW thread entries out of the main agent's future context
-- supports BTW-only model and thinking overrides without changing the main thread settings
-- lets you inject the full thread, or a summary of it, back into the main agent
-- optionally saves an individual BTW exchange as a visible session note with `--save`
+## Requirements
+
+- Pi 1.1.0 desktop with the matching managed native-session patch (it adds the atomic conversation snapshot, the host visibility control and the saved-session publication; editing this package does not activate it).
+- macOS arm64 with the package-local node-pty 1.1.0 prebuilt (executable helper) and @xterm/headless 5.5.0. Install scripts must not be used as an implicit compiler fallback.
+
+## Commands (desktop TUI)
+
+| Command | What it does |
+|---|---|
+| `/btw`, `/side` | Open the contextual popup, or reopen the existing one. The first open takes an atomic cut of the main conversation, model and thinking level (unfinished main work is inherited as non-executing history). Text after the command is the first message of a NEW session; a live child refuses it (type in its editor instead). Flags such as `--save` are refused on this route. |
+| `/btw:tangent` | Blank session: starts with no main conversation. |
+| `/btw:ask` | Read-only session: inherits the main conversation; the child is started with `--tools read,grep,find,ls` and `--exclude-tools` for MCP-style tools. |
+| `/btw menu` | With no session: start contextual, blank or read-only. With a saved or live session: Reopen, Hand off to main, Open separately; while no child is live also New contextual / blank / read-only (the saved one is kept). |
+| `/btw:inject [instructions]` | Put the side thread (active branch only) in an editor with a lead-in, then send it to main on confirmation. |
+| `/btw:summarize [instructions]` | Same, but as a bounded summary: input over 24000 characters is refused, output is capped at 2048 tokens, timeout 60 s. This is a real model call on a real host. |
+| `/btw:promote` | Shows the ordinary `pi --session-dir … --session …` command for the saved session. No copy is made: the side session already is a normal session. |
+| `/btw:clear` | Explains that native sessions are not cleared; use the menu to start a new one. |
+
+A mode-specific command never silently reopens a different mode: `/btw:ask` while a blank session exists says so. `/btw:new`, `/btw:model` and `/btw:thinking` are unavailable while a native session exists (use the child's own `/model`). Nested native sessions (`/btw` inside the popup child) are not supported.
+
+When main is busy, a handoff asks **Follow-up (default)** or **Steer**. *Scripted:* steer reaches the next model request after the current tool result; follow-up waits until the run has ended.
+
+## Popup controls
+
+- `Ctrl+]` hides the popup; `/btw` shows the same live child again with its draft, dialogs and history intact. Hiding exposes the covered main output.
+- `Shift+PageUp/PageDown` scroll the child's normal-buffer history; everything else goes to the child's own editor (Escape and Ctrl+C included).
+- Main keeps working while the popup is open or hidden. A dialog the child opens while hidden waits until you reopen the popup; the child's agent work is not paused.
+- `/quit` inside the popup ends the child; the session file stays and `/btw` resumes it.
+
+## Quiet attention while hidden
+
+While the popup is hidden the host status line shows one compact line per event: `BTW: finished`, `BTW: failed` or `BTW: needs your input`. It is cleared when you reopen the popup and when a hidden child exits. Nothing steals focus. The child state is polled every 250 ms. These wordings and the polling interval are candidate choices the owner has not approved.
+
+## One writer per session file
+
+A BTW session is an ordinary Pi session file; two Pi processes must not append to it. While the popup child is live, **Open separately** and `/btw:promote` therefore say "Quit the popup child first (/quit in the popup)…" and still show the command. This is advice only. Nothing enforces it, and a later `/btw` in the host can resume a session that you opened separately.
+
+## Handoff follows the active branch
+
+If you use `/tree` inside the popup child and continue from an earlier point, the abandoned turns stay in the file but are **not** handed off. The handoff reads the parent chain of the last entry, which is what Pi shows as the current branch once something has been appended or the child has been reopened (a /tree move not yet followed by a message is not in the file, so a handoff made right then still sees the branch the child just left). Main's own inherited conversation is never handed back, even if you /tree to a point inside it and continue from there.
+
+## Known limits
+
+- **Images:** child images are unsupported. Only the child gets `PI_IMAGE_PROTOCOL=none`; known image output becomes an explicit "Unsupported child image" text, and image data is not stripped from conversation or model context. Main-session images can still obscure popup rows (the parent compositor is unchanged).
+- One terminal-size family was exercised (110x40, resized to 100x36 and back).
+- Keys and terminal replies are dropped after the child's exit event, but node-pty can close the PTY just before that event, so a late write can still reach a closed PTY. This is hardening, not a guarantee.
+- Native sessions are macOS arm64 only.
+
+## What has and has not been verified
+
+Candidate-r12f was checked with unit tests, mutants, a derived overlay and scripted native journeys (a real Pi child on a real pseudo-terminal, scripted provider, no model, no network, no credentials). Observed: popup open, hide and reopen with draft and dialogs; main progress while the popup is up; the model and thinking cut; resume of a saved session; blank and read-only modes (the read-only child's active tool set, as reported by Pi's `getActiveTools`, was exactly `read, grep, find, ls` and the blank child's was larger; the provider request carries no tool list in this Pi build, so this is Pi's own declaration, not a read of the wire); mode-mismatch refusal; the menu; handoff with a scripted summarizer (output cap 2048 seen at the provider); steer versus follow-up; cancel sends nothing; `/tree` branch handoff; hidden finished, needs-input and failed status; status cleared when a hidden child exits; the live open-separately/promote notice; compaction before a contextual open; Escape abort in main while the popup is hidden; resize while the child exits.
+
+Not verified: a real model or real summarizer call, the wire-level token limit on a real provider, the closed-PTY write guard firing in a real run, other terminals or sizes, personal and work Pi profiles, the installed (managed) Pi, deployment. Passing these checks is not owner acceptance of the candidate's wording, polling interval or summarizer defaults.
 
 ## Install
 
-pi-btw supports Pi 0.85.1 through 1.x.
+This source targets exact Pi 1.1.0, including its matched companion packages. Native support currently targets macOS arm64 with node-pty 1.1.0 and @xterm/headless 5.5.0. Install scripts must not be used as an implicit compiler fallback. The package-local prebuilt helper must be executable; the extension does not change runtime permissions.
 
-Development dependencies target Pi 0.99.2. CI runs the tests and typecheck
-against the locked dependencies, Pi 0.85.1, and the latest published Pi release
-on each PR and weekly. Pi 0.99.2 requires Node.js 22.19.0 or newer.
+The maintained native-session patch must be reviewed/applied through the managed source mechanism. Source edits do not activate it. The scripted product journey remains allocation-gated; source/type/unit checks are not native acceptance.
 
 ### From npm (after publish)
 
@@ -53,7 +92,11 @@ Then reload pi:
 pi install /absolute/path/to/pi-btw
 ```
 
-## Usage
+## Legacy SDK/headless route
+
+The text below documents the older SDK side chat. It applies to headless, RPC and SDK hosts. On the desktop TUI `/btw`, `/side`, `/btw:tangent` and `/btw:ask` use the native popup instead, and `/btw:inject`, `/btw:summarize`, `/btw:promote` and `/btw:clear` act on the native session when one exists.
+
+### Usage
 
 ```text
 /btw what file defines this route?
@@ -72,7 +115,7 @@ pi install /absolute/path/to/pi-btw
 /btw:clear
 ```
 
-## Commands
+### Commands
 
 ### `/btw [--save] <question>`
 
@@ -93,7 +136,7 @@ pi install /absolute/path/to/pi-btw
 - shares the same thread, overlay, persistence, model, and thinking settings as `/btw`
 - `/btw` stays canonical; lifecycle commands remain under the `/btw:*` namespace, so there is no `/side:new` or `/side:clear`
 
-## Overlay controls
+### Overlay controls
 
 - `Alt+w` toggles the overlay between the framed window layout (inset from the terminal edges) and a full-width layout
 - full-width mode makes terminal Shift+drag selection capture only the dialog's own text, which is handy for copying without pulling in surrounding main-screen content
@@ -177,7 +220,7 @@ pi install /absolute/path/to/pi-btw
 - `clear` removes the override and returns BTW to inheriting the main thread thinking level
 - changing `/btw:model` or `/btw:thinking` disposes the current BTW sub-session and applies the new settings on the next BTW prompt while preserving the hidden thread
 
-## Behavior
+### Behavior
 
 ### Real sub-session model
 
@@ -247,7 +290,7 @@ Inside the BTW modal composer, slash handling is split at the BTW/session bounda
 
 This keeps BTW-owned lifecycle commands explicit while giving the side conversation the same slash-command surface as the underlying sub-session.
 
-## Behavior
+### Behavior
 
 ### Hidden BTW thread state
 
@@ -263,7 +306,7 @@ BTW exchanges are persisted in the session as hidden custom entries so they:
 
 If you use `--save`, that one BTW exchange is also written as a visible custom message in the session transcript.
 
-## Why
+### Why
 
 Sometimes you want to:
 
@@ -271,13 +314,13 @@ Sometimes you want to:
 - think through next steps without derailing the current turn
 - explore an idea, then inject it back once it's ready
 
-## Included skill
+### Included skill
 
 This package also ships a small `btw` skill so pi can better recognize when a side-conversation workflow is appropriate.
 
 It helps with discoverability and guidance, but it is not required for the extension itself to work.
 
-## Development
+### Development
 
 The extension entrypoint is:
 
@@ -292,6 +335,7 @@ To use it without installing:
 ```bash
 pi -e /path/to/pi-btw
 ```
+
 
 ## DeepSeek Harness
 
@@ -317,3 +361,4 @@ See the [DSH side-conversation guide](https://github.com/weijiafu14/pi2dsh/tree/
 ## License
 
 MIT
+

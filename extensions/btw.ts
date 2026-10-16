@@ -39,8 +39,12 @@ import {
   type OverlayOptions,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { loadBtwExtensionResources, readBtwExtensionSources } from "./btw-extension-tools";
+import { NativeBtwPopup, type NativeMode } from "./btw-native";
+import { ChildAttention } from "./btw-attention";
+import { nativeLegacyRoute, openSeparatelyCommand, runHandoff, runMenu, separateTerminalNotice, sideThreadFromSession } from "./btw-menu";
+import { boundedSummarize } from "./btw-summary";
 
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
@@ -175,6 +179,9 @@ const BTW_SYSTEM_PROMPT = [
 const BTW_SUMMARIZE_SYSTEM_PROMPT =
   "Summarize the side conversation concisely. Preserve key decisions, plans, insights, risks, and action items. Output only the summary.";
 
+/** Base prompt of the summarizer. The parent's own system prompt (project instructions, tool text) is deliberately NOT inherited by summaries. */
+const BTW_SUMMARIZER_BASE_PROMPT = "You summarize a side conversation so it can be handed to another agent.";
+
 const BTW_CONTINUE_THREAD_USER_TEXT = "[The following is a separate side conversation. Continue this thread.]";
 const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conversation.";
 
@@ -305,9 +312,10 @@ function createBtwResourceLoader(
   tools: readonly string[] | (() => readonly string[]),
   appendSystemPrompt: string[] = [BTW_SYSTEM_PROMPT],
   extensionResources?: ResourceLoader,
+  basePromptOverride?: string,
 ): ResourceLoader {
   const extensionsResult = extensionResources?.getExtensions() ?? { extensions: [], errors: [], runtime: createExtensionRuntime() };
-  const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
+  const systemPrompt = basePromptOverride ?? stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
   // Preserve the parent's project/custom instructions, but override capability
   // claims in its rendered prompt and in the history seeded into this child.
   const capabilities = () => {
@@ -1731,6 +1739,45 @@ class BtwOverlayComponent extends Container implements Focusable {
 }
 
 export default function (pi: ExtensionAPI) {
+  const nativePopup = new NativeBtwPopup(BTW_FOCUS_SHORTCUTS);
+  const persistNative = () => { if (nativePopup.pointer) pi.appendEntry("btw-native-session", nativePopup.pointer); };
+  const readNativeThread = () => { const pointer = nativePopup.pointer;return pointer ? sideThreadFromSession(readFileSync(pointer.sessionFile, "utf8"), pointer.seedLeafId).exchanges : []; };
+  const nativeHandoff = (ctx: ExtensionCommandContext, kind?: "summary" | "full", preface?: string) => runHandoff({ ui: ctx.ui, isIdle: () => ctx.isIdle(), send: (text, deliverAs) => pi.sendUserMessage(text, deliverAs ? { deliverAs } : undefined), readThread: readNativeThread, summarize: exchanges => summarizeThread(ctx, exchanges), kind, preface });
+  /** /btw menu: contextual, blank and read-only starts, confirmed handoff to main, and the copyable separate-terminal command. */
+  const runNativeMenu = async (ctx: ExtensionCommandContext) => {
+    try {
+      await runMenu({
+        ui: ctx.ui,
+        state: () => ({ mode: nativePopup.currentMode, live: nativePopup.isLive }),
+        reopen: async () => { await nativePopup.open(ctx);persistNative(); },
+        // A failed start must not lose the saved session pointer.
+        startNew: async (mode) => { const previous = nativePopup.pointer;nativePopup.forget();try { await nativePopup.open(ctx, "", mode); } catch (error) { nativePopup.restore(previous);throw error; }persistNative(); },
+        handoff: () => nativeHandoff(ctx),
+        openSeparately: () => nativePopup.pointer ? openSeparatelyCommand(nativePopup.pointer) : undefined,
+      });
+    } catch (error) { ctx.ui.notify(String(error), "error"); }
+  };
+  const openContextualPopup = async (args: string, ctx: ExtensionCommandContext, mode?: NativeMode) => {
+    const menuRequested = !mode && args.trim() === "menu";
+    if (ctx.mode !== "tui" || !ctx.hasUI) {
+      if (menuRequested) { ctx.ui.notify("The BTW menu is available in the desktop TUI only.", "warning");return; }
+      return dispatchBtwCommand(mode === "blank" ? "btw:tangent" : mode === "readonly" ? "btw:ask" : "btw", args, ctx);
+    }
+    if (process.env.PI_BTW_NATIVE_CONTROL) { ctx.ui.notify("Nested native BTW sessions are outside this milestone.", "warning");return; }
+    if (menuRequested) { await runNativeMenu(ctx);return; }
+    if (args.trim().startsWith("--")) { ctx.ui.notify("Legacy BTW flags are unavailable on the native contextual route.", "warning");return; }
+    try { await nativePopup.open(ctx, args, mode);persistNative(); } catch (error) { ctx.ui.notify(String(error), "error"); }
+  };
+  // Child side of the quiet-attention status: only a native child (control file present) writes its compact state for the host.
+  if (process.env.PI_BTW_NATIVE_CONTROL) {
+    const childAttention = new ChildAttention(process.env.PI_BTW_NATIVE_CONTROL);
+    const quiet = (action: () => void) => () => { try { action(); } catch { /* the status line is optional; never disturb the child */ } };
+    pi.on("agent_start", quiet(() => childAttention.agentStart()));
+    pi.on("agent_end", event => { try { childAttention.agentEnd(event.messages as ReadonlyArray<{ role?: string; stopReason?: string }>); } catch { /* optional */ } });
+    pi.on("agent_settled", quiet(() => childAttention.agentSettled()));
+    pi.on("ui_prompt_start", quiet(() => childAttention.promptStart()));
+    pi.on("ui_prompt_end", quiet(() => childAttention.promptEnd()));
+  }
   let pendingThread: BtwDetails[] = [];
   let pendingMode: BtwThreadMode = "contextual";
   let btwModelOverride: SessionModel | null = null;
@@ -2335,6 +2382,31 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function dispatchBtwCommand(name: string, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
+    // PF1 (only when a native session pointer exists; otherwise this block is skipped entirely and the legacy handlers run unchanged): with a native session (live or saved) and no SDK thread, /btw:inject, :summarize, :promote and :clear act on the NATIVE thread, not on the empty SDK one.
+    if (!process.env.PI_BTW_NATIVE_CONTROL && nativePopup.pointer && (name === "btw:inject" || name === "btw:summarize" || name === "btw:promote" || name === "btw:clear")) {
+      // /btw:clear must NOT wait for the in-flight SDK turn (legacy /btw:clear aborts it); the other three wait for it exactly as their legacy handlers do.
+      if (name !== "btw:clear") await btwSubmissionQueue;
+      const route = nativeLegacyRoute(name, { tui: ctx.mode === "tui" && ctx.hasUI, hasNative: !!nativePopup.pointer, sdkThreadEmpty: pendingThread.length === 0 && !activeBtwSession });
+      if (route) {
+        const extra = args.trim();
+        try {
+          if (route.action === "handoff") {
+            const lead = route.kind === "full"
+              ? (extra ? "Here is a side conversation I had. " + extra : "Here is a side conversation I had for additional context:")
+              : (extra ? "Here is a summary of a side conversation I had. " + extra : "Here is a summary of a side conversation I had:");
+            await nativeHandoff(ctx, route.kind, lead);
+          } else if (route.action === "open-separately") {
+            const command = nativePopup.pointer ? openSeparatelyCommand(nativePopup.pointer) : undefined;
+            const notice = separateTerminalNotice(command, nativePopup.isLive, "This BTW session is already a normal Pi session. Continue it in its own terminal:");ctx.ui.notify(notice.message, notice.type);
+          } else ctx.ui.notify(route.message, "info");
+        } catch (error) { ctx.ui.notify(String(error), "error"); }
+        return true;
+      }
+    }
+    if (nativePopup.hasSession() || process.env.PI_BTW_NATIVE_CONTROL) {
+      ctx.ui.notify("Legacy BTW modes/handoff are unavailable while the native contextual popup is active; use /btw to reopen it.", "warning");
+      return false;
+    }
     const trimmedArgs = args.trim();
 
     if (name === "btw") {
@@ -2929,39 +3001,38 @@ export default function (pi: ExtensionAPI) {
 
     const modelRuntimeOptions = await createBtwModelRuntimeOptions(ctx, model);
 
-    const sessionOptions: CreateAgentSessionOptions = {
-      sessionManager: SessionManager.inMemory(),
-      model,
-      ...modelRuntimeOptions,
-      thinkingLevel: "off",
-      tools: [],
-      resourceLoader: createBtwResourceLoader(ctx, [], [BTW_SUMMARIZE_SYSTEM_PROMPT]),
-    };
-    const { session } = await createAgentSession(sessionOptions);
-
-    try {
-      await session.prompt(formatThread(thread), { source: "extension" });
-
-      const response = getLastAssistantMessage(session);
-      if (!response) {
-        throw new Error("BTW summarize finished without a response.");
-      }
-      if (response.stopReason === "error") {
-        throw new Error(response.errorMessage || "Failed to summarize BTW thread.");
-      }
-      if (response.stopReason === "aborted") {
-        throw new Error("BTW summarize aborted.");
-      }
-
-      return extractAnswer(response);
-    } finally {
-      try {
-        await session.abort();
-      } catch {
-        // Ignore abort errors during summarize session shutdown.
-      }
-      session.dispose();
-    }
+    // Bounded: input gate, model copy with a capped maxTokens, timeout/abort, truncated output refused (btw-summary.ts).
+    const outcome = await boundedSummarize<SessionModel>(
+      {
+        open: async (cappedModel) => {
+          const sessionOptions: CreateAgentSessionOptions = {
+            sessionManager: SessionManager.inMemory(),
+            model: cappedModel,
+            ...modelRuntimeOptions,
+            thinkingLevel: "off",
+            tools: [],
+            resourceLoader: createBtwResourceLoader(ctx, [], [BTW_SUMMARIZE_SYSTEM_PROMPT], undefined, BTW_SUMMARIZER_BASE_PROMPT),
+          };
+          const { session } = await createAgentSession(sessionOptions);
+          return {
+            prompt: (text: string) => session.prompt(text, { source: "extension" }),
+            abort: () => session.abort(),
+            dispose: () => session.dispose(),
+            lastAssistant: () => {
+              const message = getLastAssistantMessage(session);
+              return message
+                ? { stopReason: message.stopReason, errorMessage: message.errorMessage, text: extractText(message.content, "text"), usage: message.usage, model: message.model }
+                : undefined;
+            },
+          };
+        },
+        setTimer: (fn, ms) => setTimeout(fn, ms),
+        clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      },
+      model as SessionModel,
+      formatThread(thread),
+    );
+    return outcome.text;
   }
 
   function sendThreadToMain(ctx: ExtensionCommandContext, content: string): void {
@@ -3024,6 +3095,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    for (const entry of ctx.sessionManager.getBranch()) if (entry.type === "custom" && entry.customType === "btw-native-session") nativePopup.restore(entry.data);
     await restoreThread(ctx);
   });
 
@@ -3032,6 +3104,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    await nativePopup.shutdown();
     invalidateBtwLifecycle();
     await disposeBtwSession();
     dismissOverlay();
@@ -3041,6 +3114,7 @@ export default function (pi: ExtensionAPI) {
     pi.registerShortcut(shortcut, {
       description: "Toggle BTW overlay focus while leaving it open.",
       handler: async (_ctx) => {
+        if (nativePopup.hasSession()) { nativePopup.toggle();return; }
         toggleOverlayFocus();
       },
     });
@@ -3057,30 +3131,30 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("btw", {
-    description: "Continue a side conversation in a focused BTW modal. Add --save to also persist a visible note.",
+    description: "Open or resume the native contextual Pi popup (desktop TUI); /btw menu offers contextual, blank and read-only starts, handoff to main, and the separate-terminal command. Headless modes retain the SDK route.",
     handler: async (args, ctx) => {
-      await dispatchBtwCommand("btw", args, ctx);
+      await openContextualPopup(args, ctx);
     },
   });
 
   pi.registerCommand("side", {
-    description: "Alias for /btw: continue a side conversation in a focused BTW modal.",
+    description: "Alias for the contextual /btw route.",
     handler: async (args, ctx) => {
-      await dispatchBtwCommand("btw", args, ctx);
+      await openContextualPopup(args, ctx);
     },
   });
 
   pi.registerCommand("btw:tangent", {
-    description: "Start or continue a contextless BTW tangent in the focused BTW modal.",
+    description: "Start or continue a contextless BTW tangent: a blank native Pi popup on desktop TUI; headless modes retain the SDK route.",
     handler: async (args, ctx) => {
-      await dispatchBtwCommand("btw:tangent", args, ctx);
+      await openContextualPopup(args, ctx, "blank");
     },
   });
 
   pi.registerCommand("btw:ask", {
-    description: "Ask a read-only side question: inherits main-session context but exposes only read/grep/find/ls tools.",
+    description: "Read-only side popup: inherits main-session context; the native child is limited to read/grep/find/ls (desktop TUI); headless modes retain the SDK route.",
     handler: async (args, ctx) => {
-      await dispatchBtwCommand("btw:ask", args, ctx);
+      await openContextualPopup(args, ctx, "readonly");
     },
   });
 
