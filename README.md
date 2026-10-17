@@ -10,7 +10,7 @@ Status of this text: written against candidate-r12g, which has not been copied i
 
 ## Requirements
 
-- Pi 1.1.0 desktop with the matching managed native-session patch (it adds the atomic conversation snapshot, the host visibility control and the saved-session publication; editing this package does not activate it).
+- Pi 1.2.0 desktop (1.1.0 also works) with the matching managed native-session patch (it adds the atomic conversation snapshot, the host visibility control and the saved-session publication; editing this package does not activate it).
 - macOS arm64 with the package-local node-pty 1.1.0 prebuilt (executable helper) and @xterm/headless 5.5.0. Install scripts must not be used as an implicit compiler fallback.
 
 ## Commands (desktop TUI)

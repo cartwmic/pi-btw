@@ -21,7 +21,8 @@ All notable changes to this project are documented here.
   and prints the `pi --session` command to open it.
 
 ### Changed
-- Pi peer/dev dependencies are pinned to 1.1.0; node-pty 1.1.0, @xterm/headless 5.5.0 and
+- Pi peer/dev dependencies and CI move to Pi 1.2.0 (the managed `btw-native-session` patch has
+  exact payloads for 1.1.0 and 1.2.0; the extension code is unchanged). Was: pinned to 1.1.0; node-pty 1.1.0, @xterm/headless 5.5.0 and
   node-addon-api 7.1.0 are runtime dependencies. CI tests the locked Pi 1.1.0 cohort only
   (Node 24.18.1, `npm ci --ignore-scripts`); the old minimum/latest matrix is removed.
 
